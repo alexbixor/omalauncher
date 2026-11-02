@@ -1,0 +1,155 @@
+widget "openrouter" {
+  // Ask any model on OpenRouter from the home screen. The API key is typed in once and kept encrypted on
+  // the phone, never in this file; make one at openrouter.ai/settings/keys. Every answer comes back with
+  // what it cost (OpenRouter puts usage.cost in every answer), and the tile keeps the total. An answer arrives
+  // whole, not word by word: post() waits for it, up to 30 s, so max_tokens keeps answers short enough for that.
+  meta { description: "Ask any model on OpenRouter from home: a chat in the tile, the key kept encrypted on the phone, and what each answer cost"; version: "1.0"; license: "MIT"; category: "productivity"; owl: 12 }
+  size: 6x3
+  minSize: 4x2
+  onTap: screen()
+
+  state key = null secret
+  // The model asked, by its OpenRouter id; picked on the screen, from the free ones or typed in.
+  state model = "anthropic/claude-haiku-5.5" persist
+  // The conversation, as the API takes it: {role, content}. The last 12 messages go with each question.
+  state chat = [] persist
+  // What the answers cost so far, in dollars, as OpenRouter reports it with each one.
+  state spent = 0 persist
+  state pending = false
+  // post's answer: {ok, code, out, err}. Starts at 0 so the first answer counts as a change.
+  state reply = 0
+  state problem = ""
+  state picking = false
+
+  // The key's own standing: what it spent this month and, when it has a cap, what's left of it. A null URL waits for the
+  // key rather than asking without one. (/credits, the account's balance, takes a management key, which a normal one isn't.)
+  source me = http(key == null ? null : "https://openrouter.ai/api/v1/key", {Authorization: "Bearer ${key}"}) every 10m timeout 15s json status
+  // The models that cost nothing, fetched only while the picker is open; the list itself needs no key.
+  source free = http(picking ? "https://openrouter.ai/api/v1/models?max_price=0" : null) every 1h timeout 20s json
+
+  let short = last(split(model, "/"))
+  // The key's cap left when it has one, else what it spent this month, as the tile's one number.
+  let standing = me.ok != true ? null : me.out.data.limit_remaining != null ? "$" + fixed(me.out.data.limit_remaining, 2) + " left" : "$" + fixed(me.out.data.usage_monthly ?? 0, 2) + " this month"
+  let lastMsg = len(chat) > 0 ? chat[len(chat) - 1] : null
+  let answer = lastMsg.role == "assistant" ? lastMsg.content : null
+  let freeIds = sortBy(map(free.data ?? [], m => m.id), x => x)
+  // A few paid ones worth a tap, cheap and quick; any other id can be typed in.
+  let picks = ["anthropic/claude-haiku-5.5", "openai/gpt-5-nano", "google/gemini-2.5-flash-lite", "deepseek/deepseek-v4.1-flash-1017", "openrouter/auto"]
+
+  on reply {
+    pending = false
+    if value.ok {
+      chat = chat + [{role: "assistant", content: trim(value.out.choices[0].message.content ?? "")}]
+      spent = spent + (value.out.usage.cost ?? 0)
+      problem = ""
+    } else {
+      problem = value.out.error.message ?? (value.err != "" ? value.err : "no answer (${value.code})")
+    }
+  }
+
+  // The question field, on the tile and on the screen. The key goes in the header written out here: a let can't hold it.
+  component Ask(hint) {
+    Input {
+      placeholder: pending ? "thinking…" : hint
+      clear: true
+      onSubmit: {
+        let text = trim(value)
+        if text != "" && !pending && key != null {
+          chat = chat + [{role: "user", content: text}]
+          pending = true
+          problem = ""
+          reply = post("https://openrouter.ai/api/v1/chat/completions", {
+            model: model,
+            messages: [{role: "system", content: "You answer on a phone's home screen: briefly, in plain text, no markdown."}] + drop(chat, max(0, len(chat) - 12)),
+            max_tokens: 400
+          }, {Authorization: "Bearer ${key}", "HTTP-Referer": "https://github.com/SimonSchubert/omalauncher", "X-Title": "Omalauncher"})
+        }
+      }
+    }
+  }
+
+  Column {
+    gap: 6
+    if key == null {
+      Text { text: "An OpenRouter API key, from openrouter.ai/settings/keys. It's kept encrypted on this phone."; style: muted; maxLines: 3 }
+      Input { placeholder: "sk-or-v1-…"; password: true; onSubmit: key = trim(value) }
+    } else {
+      Row {
+        align: center
+        gap: 8
+        Text { text: short; style: small; color: accent; onTap: screen() }
+        Spacer { weight: 1 }
+        Text { text: me.code == 401 ? "key refused" : (standing ?? ""); style: small; color: muted }
+      }
+      Column {
+        scroll: true
+        weight: 1
+        Text {
+          text: problem != "" ? problem : pending ? "…" : (answer ?? "Ask ${short} anything. Tap the tile for the whole chat and other models.")
+          color: problem != "" ? red : foreground
+          fontSize: (tileHeight ?? 999) < 185 ? 13 : 15
+        }
+      }
+      Ask { hint: "ask ${short}…" }
+    }
+  }
+
+  screen {
+    title: "openrouter"
+    Column {
+      gap: 8
+      padding: [12, 0]
+      Row {
+        align: center
+        gap: 8
+        Text { text: model; color: accent; weight: 1; onTap: picking = !picking }
+        Text { text: picking ? "⌃" : "⌄"; color: muted; onTap: picking = !picking }
+        Text { text: "spent $" + fixed(spent, 3); style: small; color: muted }
+      }
+      if picking {
+        Text { text: "free, as OpenRouter lists them now"; style: label }
+        Column {
+          scroll: true
+          height: 240
+          gap: 6
+          if free == null { Text { text: "loading…"; style: muted } }
+          for id in freeIds key id {
+            Text { text: id; color: id == model ? accent : foreground; onTap: { model = id; picking = false } }
+          }
+        }
+        Text { text: "paid, cheap and quick"; style: label }
+        Flow {
+          gap: 8
+          for id in picks key id {
+            Text { text: last(split(id, "/")); color: id == model ? accent : foreground; padding: [8, 4]; border: 1; borderColor: border; onTap: { model = id; picking = false } }
+          }
+        }
+        Text { text: "or any model id"; style: label }
+        Input { placeholder: "vendor/model"; onSubmit: { if trim(value) != "" { model = trim(value) }; picking = false } }
+      } else {
+        if len(chat) == 0 { Text { text: "Nothing asked yet."; style: muted } }
+        Column {
+          lazy: true
+          reverse: true
+          weight: 1
+          gap: 10
+          for m, i in reverse(chat) key len(chat) - 1 - i {
+            Column {
+              gap: 2
+              Text { text: m.role == "user" ? "you" : short; style: label; color: m.role == "user" ? muted : accent }
+              Text { text: m.content }
+            }
+          }
+        }
+        if problem != "" { Text { text: problem; color: red; style: small } }
+        Ask { hint: "ask ${short}…" }
+        Row {
+          gap: 16
+          Text { text: "clear chat"; color: muted; style: small; onTap: chat = [] }
+          Spacer { weight: 1 }
+          Text { text: "sign out"; color: muted; style: small; onTap: { key = null; chat = []; spent = 0 } }
+        }
+      }
+    }
+  }
+}
